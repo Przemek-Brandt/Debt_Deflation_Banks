@@ -52,7 +52,7 @@ panel_unbalanced_ratios_date$Date <- as.Date(panel_unbalanced_ratios_date$Date)
 panel_unbalanced_real_date$Date <- as.Date(panel_unbalanced_real_date$Date)
 
 # Add an identifier for the banktype
-Banktype <- readxl::read_xlsx(
+banktype <- readxl::read_xlsx(
   here::here("DATA", "Bankentyp.xlsx")
 )
 
