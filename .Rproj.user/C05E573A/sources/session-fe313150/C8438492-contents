@@ -1,0 +1,2817 @@
+---
+title: "04_Models"
+author: "Przemyslaw Brandt, Lukas Mair, Martin Mosler, Christoph A. Schaltegger"
+date: "11 09 2026"
+output: html_document
+---
+######## Setup
+
+```{r setup, include=FALSE}
+rm(list=ls())
+library(readxl) 
+library(stringr)
+library(ggplot2)
+library(tidyverse)
+library(openxlsx)
+library(scales)
+library(fixest)
+library(readr)
+library(sjlabelled)
+library(ggrepel)
+library(plm)
+library(lmtest)
+library(DescTools)
+library(patchwork)
+library(modelsummary)
+library(purrr)
+library(broom)
+library(dplyr)
+library(tidyr)
+library(here)
+library(renv)
+
+
+```
+
+The firm dataset was created in the other R-scripts. Therefore we just need to load them here.
+We combine the datasets with the classification of the banks in cantonal banks and noncantonal banks.
+
+```{r Reading firm datasets}
+
+here::i_am("04_Models.Rmd")
+
+panel_unbalanced_ratios_date <- readxl::read_xlsx(
+  here::here("DATA", "panel_unbalanced_ratios_date.xlsx")
+)
+
+panel_unbalanced_real_date <- readxl::read_xlsx(
+  here::here("DATA", "panel_unbalanced_real_date.xlsx")
+)
+
+panel_unbalanced_ratios_date$Date <- as.Date(panel_unbalanced_ratios_date$Date)
+panel_unbalanced_real_date$Date <- as.Date(panel_unbalanced_real_date$Date)
+
+# Add an identifier for the banktype
+Banktype <- readxl::read_xlsx(
+  here::here("DATA", "Bankentyp.xlsx")
+)
+
+# dummy for cantonal bank
+banktype <- banktype %>%
+  mutate(cantonal = ifelse(Banktyp == 1, 1, 0)) %>%
+  mutate(private = ifelse(Banktyp >= 2, 1, 0))
+
+panel_unbalanced_ratios_date <- panel_unbalanced_ratios_date %>%
+  mutate(ID = as.numeric(ID)) %>%
+  left_join(banktype %>% select(ID, Banktyp, cantonal, private), by = "ID")
+
+panel_unbalanced_real_date <- panel_unbalanced_real_date %>%
+    mutate(ID = as.numeric(ID)) %>%
+  left_join(banktype %>% select(ID, Banktyp, cantonal, private), by = "ID")
+
+```
+
+```{r Creating Post Variable}
+
+panel_unbalanced_ratios_date <- panel_unbalanced_ratios_date %>%
+  mutate(post = ifelse(Date > as.Date("1920-09-30"), 1, 0))
+
+panel_unbalanced_real_date <- panel_unbalanced_real_date %>%
+  mutate(post = ifelse(Date > as.Date("1920-09-30"), 1, 0))
+
+```
+
+```{r Adding "year-date" reference based on fiscal year from 10-01 to 09-30 the following year}
+
+# Step 2: Create the t variable based on 1-year periods starting Oct 1
+panel_unbalanced_ratios_date <- panel_unbalanced_ratios_date %>%
+  arrange(Date) %>%
+  mutate(
+    t = as.integer(floor((as.numeric(Date - as.Date("1916-10-01"))) / 365.25)) + 1
+  )
+
+panel_unbalanced_real_date <- panel_unbalanced_real_date %>%
+  arrange(Date) %>%
+  mutate(
+    t = as.integer(floor((as.numeric(Date - as.Date("1916-10-01"))) / 365.25)) + 1
+  )
+
+```
+
+We calculate the Liabilities to asset ratio (leverage) at the onset of deflation. We calculate it in three different ways:
+- Leverage-ratio: This is just the percentual amount for each bank compared to the total sum of assets.
+- Leverage-dummy: We classify a bank in the high leverage group if the leverage median of this bank's average leverage of the years 1919 and 1920 is above the median over all banks.
+- leverage dummy for cantonal and non-cantonal banks seperately:  We classify a bank in the high leverage group if the leverage median of this bank's average leverage of the years 1919 and 1920 is above the median over all banks in the specific group.
+
+We also append the indicator for cantonal banks to each dataset.
+
+```{r Liabilities-to-Asset-Ratio}
+
+library(dplyr)
+
+# Step 1: Filter the dataset for liabilities categories (3)
+liabilities_data <- panel_unbalanced_real_date %>%
+  filter(grepl("\\(3\\.", Category))
+
+# Step 2: Sum liabilities by ID, t, and Banktype
+liabilities_sum <- liabilities_data %>%
+  group_by(ID, t, cantonal) %>%
+  summarise(total_liabilities = sum(Value, na.rm = TRUE), .groups = 'drop')
+
+# Step 3: Filter the dataset for assets (Category: "Sum of Assets")
+assets_data <- panel_unbalanced_real_date %>%
+  filter(Category == "Sum of Assets")
+
+# Step 3b: Filter the dataset for loans (Category: "Loans (1.5.1)")
+loans_add_data <- panel_unbalanced_real_date %>%
+  filter(Category == "Loans (1.5.1)")
+
+# Step 3c: Filter the dataset for equity
+equity_add_data <- panel_unbalanced_real_date %>%
+  filter(Category %in% c("Additional Paid-in Capital (2.1.2)", "Stock Receivables (2.3.1)", "Share Capital (2.1.1.1)", "Share capital (2.1.1.1)", "Issued Capital (2.1.1)", "Issued capital (2.1.1)", "Issued Capital (2.2.1)", "Reatined earnings - Profit for reporting period (2.2.4)", "Retained Earnings - Appropriated (2.2.1)", "Retained Earnings - Deficit (2.2.3)", "Retained earnings - Profit for reporting period (2.2.4)", "Retained Earnings - Unappropriated (2.2.2)", "Stock Receivables (2.3.1)", "Retained earnings - Appropriated (2.2.1)"))
+
+# Step 4: Sum assets and their log value by ID, t, and Banktype
+assets_sum <- assets_data %>%
+  group_by(ID, t, cantonal) %>%
+  mutate(
+    total_assets = sum(Value, na.rm = TRUE),
+    log_total_assets = log(total_assets)
+  ) %>%
+  ungroup()
+
+# Step 4: Sum assets and their log value by ID, t, and Banktype
+loans_add_sum <- loans_add_data %>%
+  group_by(ID, t, cantonal) %>%
+  summarise(
+    total_loans = sum(Value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Step 4: Sum assets and their log value by ID, t, and Banktype
+equity_add_sum <- equity_add_data %>%
+  group_by(ID, t, cantonal) %>%
+  summarise(
+    total_equity = sum(Value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Step 5: Merge liabilities and assets datasets by ID, t, and Banktype
+liabilities_assets <- liabilities_sum %>%
+  inner_join(assets_sum, by = c("ID", "t", "cantonal"))
+
+liabilities_assets <- liabilities_assets %>%
+  left_join(loans_add_sum %>%
+              dplyr::select(ID, t, cantonal, total_loans), by = c("ID", "t", "cantonal")) %>%
+  mutate(loans_ratio = total_loans/total_assets)
+
+liabilities_assets <- liabilities_assets %>%
+  left_join(equity_add_sum %>%
+              dplyr::select(ID, t, cantonal, total_equity), by = c("ID", "t", "cantonal")) %>%
+  mutate(equity_ratio = total_equity/total_assets)
+
+# Step 6: Calculate the liabilities-to-assets ratio
+liabilities_assets <- liabilities_assets %>%
+  mutate(liabilities_to_assets_ratio = total_liabilities / total_assets)
+
+# Step 7: Filter for t = 4 and calculate average liabilities-to-assets ratio for each firm and Banktype
+liabilities_assets_avg_t4 <- liabilities_assets %>%
+  filter(t %in% c(4)) %>%
+  group_by(ID, cantonal) %>%
+  summarise(
+    average_liabilities_to_assets_ratio_t4 = mean(liabilities_to_assets_ratio, na.rm = TRUE),
+    log_total_assets = first(log_total_assets),
+    loans_ratio = first(loans_ratio),
+    equity_ratio = first(equity_ratio),
+    .groups = 'drop'
+  )
+
+# Step 8: Calculate the median of the average liabilities-to-assets ratio for t = 4 for each Banktype
+median_leverage_by_banktype <- liabilities_assets_avg_t4 %>%
+  group_by(cantonal) %>%
+  summarise(
+    median_leverage = median(average_liabilities_to_assets_ratio_t4, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Step 8.1: Calculate the average and median leverage across all Banktypes
+median_leverage_overall <- liabilities_assets_avg_t4 %>%
+  summarise(
+    overall_median_leverage = median(average_liabilities_to_assets_ratio_t4, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  pull(overall_median_leverage)  # Extract the median value for use below
+
+# Step 9: Add the "high_leverage" dummy variable (1 if above median, 0 otherwise) for each Banktype
+liabilities_assets_avg_t4 <- liabilities_assets_avg_t4 %>%
+  left_join(median_leverage_by_banktype, by = "cantonal") %>%
+  mutate(
+    high_leverage_by_banktype = ifelse(average_liabilities_to_assets_ratio_t4 > median_leverage, 1, 0),
+    high_leverage_overall = ifelse(average_liabilities_to_assets_ratio_t4 > median_leverage_overall, 1, 0),
+    overall_median_leverage = median_leverage_overall  # Add overall median as a constant column
+  )
+
+# Function to apply the merge of the calculated averages and dummy to multiple datasets
+add_leverage_variables <- function(data) {
+  data <- data %>%
+    left_join(liabilities_assets_avg_t4, by = c("ID", "cantonal"))
+  return(data)
+}
+
+# Apply this function to all the required datasets
+
+# 1. panel_unbalanced_ratios_date
+panel_unbalanced_ratios_date <- add_leverage_variables(panel_unbalanced_ratios_date)
+
+# 2. panel_unbalanced_real_date
+panel_unbalanced_real_date <- add_leverage_variables(panel_unbalanced_real_date)
+
+panel_unbalanced_real_date <- panel_unbalanced_real_date %>%
+  left_join(
+    equity_add_sum %>% dplyr::select(ID, cantonal, t, total_equity),
+    by = c("ID", "cantonal", "t")
+  )
+
+```
+
+######## Main calculations generating datasets
+```{r function for dataset preparation}
+
+prepare_outcome <- function(
+    data,
+    categories,
+    outcome,
+    weight_label = outcome,
+    periods = 2:7,
+    duplicate_rows = NULL,
+    adjust_sign = FALSE,
+    winsor_probs = c(0.01, 0.99),
+    additional_vars = NULL
+) {
+
+  # Variables retained at the ID × t level
+  standard_vars <- c(
+    post            = "post",
+    leverage        = "average_liabilities_to_assets_ratio_t4",
+    high_leverage   = "high_leverage_overall",
+    cantonal        = "cantonal",
+    private         = "private",
+    log_total_assets = "log_total_assets"
+  )
+
+  retained_vars <- c(standard_vars, additional_vars)
+
+  # 1. Select one or several categories
+  filtered <- data %>%
+    filter(Category %in% categories)
+
+  # Show ID × t combinations containing multiple source rows.
+  # With component categories, these are not necessarily duplicates.
+  multiple_entries <- filtered %>%
+    add_count(ID, t, name = "n_entries") %>%
+    filter(n_entries > 1) %>%
+    arrange(ID, t, Category)
+
+  # Remove duplictes
+  if (identical(categories, "Result")) {
+  filtered <- filtered %>%
+    arrange(ID, t, Value) %>%
+    distinct(ID, t, Value, .keep_all = TRUE)
+}
+
+  # 2. Special cleaning for Result
+  if (identical(categories, "Result")) {
+
+    filtered <- filtered %>%
+      group_by(ID, t) %>%
+      mutate(
+        n_entries = n(),
+        has_year_in_name = str_detect(
+          Name,
+          "\\b(19[0-9]{2}|20[0-9]{2})\\b"
+        )
+      ) %>%
+      filter(n_entries == 1 | !has_year_in_name) %>%
+      select(-n_entries, -has_year_in_name) %>%
+      ungroup()
+
+    if (!is.null(duplicate_rows)) {
+
+      remaining_duplicates <- filtered %>%
+        group_by(Year, ID) %>%
+        filter(n() > 1) %>%
+        ungroup()
+
+      valid_rows <- duplicate_rows[
+        duplicate_rows <= nrow(remaining_duplicates)
+      ]
+
+      rows_to_remove <- remaining_duplicates[valid_rows, ]
+
+      filtered <- filtered %>%
+        anti_join(
+          rows_to_remove,
+          by = c("Name", "ID", "t", "Value")
+        )
+    }
+  }
+
+  # 3. Apply sign convention if requested
+  filtered <- filtered %>%
+    mutate(
+      analysis_value = if (adjust_sign) {
+        case_when(
+          Assets == 1 ~ -Value,
+          Liabilities == 1 ~ Value,
+
+          Assets == 0 & Liabilities == 0 &
+            str_detect(
+              Name,
+              regex("Gewinn", ignore_case = TRUE)
+            ) ~ Value,
+
+          Assets == 0 & Liabilities == 0 &
+            str_detect(
+              Name,
+              regex("Verlust", ignore_case = TRUE)
+            ) ~ -Value,
+
+          Assets == 0 & Liabilities == 0 &
+            str_detect(
+              Name,
+              regex("Passivsaldo", ignore_case = TRUE)
+            ) ~ -Value,
+
+          TRUE ~ Value
+        )
+      } else {
+        Value
+      }
+    )
+
+  # Check that requested retained variables exist
+  missing_vars <- setdiff(unname(retained_vars), names(filtered))
+
+  if (length(missing_vars) > 0) {
+    stop(
+      "The following variables are missing from the data: ",
+      paste(missing_vars, collapse = ", ")
+    )
+  }
+
+  # 4. Aggregate outcome and retain bank characteristics
+  raw <- filtered %>%
+    group_by(ID, t) %>%
+    summarise(
+      outcome_value = sum(analysis_value, na.rm = TRUE),
+      across(
+        all_of(unname(retained_vars)),
+        ~ first(.x)
+      ),
+      .groups = "drop"
+    ) %>%
+    rename(
+      !!!setNames(
+        unname(retained_vars),
+        names(retained_vars)
+      )
+    ) %>%
+    filter(
+      !is.na(high_leverage),
+      !is.na(leverage)
+    ) %>%
+    mutate(t = as.integer(as.character(t)))
+
+  # Raw summary-statistics samples
+  raw_t4 <- raw %>%
+    filter(t == 4)
+
+  # 5. Winsorize once within each period
+  winsorized <- raw %>%
+  group_by(t) %>%
+  mutate(
+    outcome_value = DescTools::Winsorize(
+      outcome_value,
+      val = quantile(
+        outcome_value,
+        probs = winsor_probs,
+        na.rm = TRUE
+      )
+    )
+  ) %>%
+  mutate(
+    outcome_value = DescTools::Winsorize(
+      outcome_value,
+      val = quantile(
+        outcome_value,
+        probs = winsor_probs,
+        na.rm = TRUE
+      )
+    )
+  ) %>%
+  ungroup()
+
+  # 6. Construct complete ID × t grid
+  full <- expand_grid(
+    ID = unique(winsorized$ID),
+    t = periods
+  ) %>%
+    left_join(
+      winsorized,
+      by = c("ID", "t")
+    ) %>%
+    arrange(ID, t) %>%
+    mutate(
+      post = as.integer(t > 4),
+      observed = as.integer(!is.na(outcome_value))
+    )
+
+  # 7. Inclusion model
+  inclusion_model <- glm(
+    observed ~ factor(t) + factor(ID),
+    family = binomial(),
+    data = full
+  )
+
+  probability_name <- paste0("prob_inc_", weight_label)
+  weight_name      <- paste0("IPW_", weight_label)
+
+  # 8. Predicted inclusion probability and IPW
+  full <- full %>%
+    mutate(
+      "{probability_name}" := predict(
+        inclusion_model,
+        newdata = full,
+        type = "response"
+      ),
+      "{weight_name}" := if_else(
+        observed == 1L,
+        1 / pmax(.data[[probability_name]], 1e-4),
+        NA_real_
+      )
+    ) %>%
+    rename("{outcome}" := outcome_value)
+
+  raw <- raw %>%
+    rename("{outcome}" := outcome_value)
+
+  raw_t4 <- raw_t4 %>%
+    rename("{outcome}" := outcome_value)
+
+  winsorized <- winsorized %>%
+    rename("{outcome}" := outcome_value)
+
+  list(
+    raw              = raw,
+    raw_t4           = raw_t4,
+    panel            = pdata.frame(
+      winsorized,
+      index = c("ID", "t")
+    ),
+    winsorized       = winsorized,
+    full             = full,
+    inclusion_model  = inclusion_model,
+    multiple_entries = multiple_entries
+  )
+}
+
+```
+
+```{r creating the datasets}
+
+  equity_categories <- c(
+    "Additional Paid-in Capital (2.1.2)",
+    "Stock Receivables (2.3.1)",
+    "Share Capital (2.1.1.1)",
+    "Share capital (2.1.1.1)",
+    "Issued Capital (2.1.1)",
+    "Issued capital (2.1.1)",
+    "Issued Capital (2.2.1)",
+    "Reatined earnings - Profit for reporting period (2.2.4)",
+    "Retained Earnings - Appropriated (2.2.1)",
+    "Retained Earnings - Deficit (2.2.3)",
+    "Retained earnings - Profit for reporting period (2.2.4)",
+    "Retained Earnings - Unappropriated (2.2.2)",
+    "Retained earnings - Appropriated (2.2.1)"
+  )
+
+  assets_noloan_categories <- c(
+    "Other financial assets (1.3)",
+    "Additional Financial Assets and Investments (1.3.3)",
+    "Accruals and additional assets (1.4)",
+    "Receivables and Contracts (1.5)",
+    "Interest receivables (1.5.2)",
+    "Other receivables (1.5.3)"
+  )  
+  
+  equity <- prepare_outcome(
+  data         = panel_unbalanced_ratios_date,
+  categories   = equity_categories,
+  outcome      = "equity_sum",
+  weight_label = "equity",
+  additional_vars = c(
+    sector_leverage = "high_leverage_by_banktype",
+    loans_ratio     = "loans_ratio"
+  )
+)
+
+profit <- prepare_outcome(
+  data           = panel_unbalanced_ratios_date,
+  categories     = "Result",
+  outcome        = "Profit_sum",
+  weight_label   = "profit",
+  duplicate_rows = c(2, 3, 6, 7, 9, 11, 13),
+  adjust_sign     = TRUE
+)
+
+loan <- prepare_outcome(
+  data         = panel_unbalanced_ratios_date,
+  categories   = "Loans (1.5.1)",
+  outcome      = "loan_sum",
+  weight_label = "loan",
+  additional_vars = c(
+    equity_ratio = "equity_ratio"
+  )
+)
+
+assets_noloan <- prepare_outcome(
+  data         = panel_unbalanced_ratios_date,
+  categories   = assets_noloan_categories,
+  outcome      = "assets_sum",
+  weight_label = "assets_noloan"
+)
+
+# Equity
+equity_data                 <- equity$raw
+estimation_equity_raw       <- equity$raw
+estimation_equity_t4_raw    <- equity$raw_t4
+panel_equity_attrition      <- equity$panel
+full_equity                 <- equity$full
+inc_mod_equity              <- equity$inclusion_model
+
+# Profit
+profit_data                 <- profit$raw
+estimation_profit_raw       <- profit$raw
+estimation_profit_t4_raw    <- profit$raw_t4
+panel_profit_attrition      <- profit$panel
+full_profit                 <- profit$full
+inc_mod_profit              <- profit$inclusion_model
+
+# Loans
+loan_data                   <- loan$raw
+estimation_loan_raw         <- loan$raw
+estimation_loan_t4_raw      <- loan$raw_t4
+panel_loan_attrition        <- loan$panel
+full_loan                   <- loan$full
+inc_mod_loan                <- loan$inclusion_model
+
+# Financial assets excluding loans
+assets_noloan_data              <- assets_noloan$raw
+estimation_assets_noloan_raw    <- assets_noloan$raw
+estimation_assets_noloan_t4_raw <- assets_noloan$raw_t4
+panel_assets_noloan_attrition   <- assets_noloan$panel
+full_assets_noloan              <- assets_noloan$full
+inc_mod_assets_noloan           <- assets_noloan$inclusion_model
+
+
+```
+
+```{r function for summary statistics}
+make_summary_stats <- function(data, outcome) {
+
+  all_data <- data %>%
+    filter(!is.na(.data[[outcome]])) %>%
+    mutate(group = "All")
+
+  grouped_data <- data %>%
+    filter(
+      !is.na(.data[[outcome]]),
+      cantonal %in% c(0, 1)
+    ) %>%
+    mutate(
+      group = if_else(
+        cantonal == 1,
+        "State = 1",
+        "State = 0"
+      )
+    )
+
+  bind_rows(all_data, grouped_data) %>%
+    group_by(group) %>%
+    summarise(
+      N      = n(),
+      N_ID   = n_distinct(ID),
+      mean   = mean(.data[[outcome]], na.rm = TRUE),
+      sd     = sd(.data[[outcome]], na.rm = TRUE),
+      median = median(.data[[outcome]], na.rm = TRUE),
+      min    = min(.data[[outcome]], na.rm = TRUE),
+      max    = max(.data[[outcome]], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      group = factor(
+        group,
+        levels = c("All", "State = 1", "State = 0")
+      )
+    ) %>%
+    arrange(group)
+}
+```
+
+```{r function for regression models}
+estimate_outcome_models <- function(
+    full_data,
+    raw_data,
+    raw_t4,
+    outcome,
+    weight,
+    reference_period = 4
+) {
+
+  # Construct formulas
+  ratio_nocontrol_formula <- as.formula(
+    paste0(
+      outcome,
+      " ~ leverage * i(t, ref = ",
+      reference_period,
+      ") | ID + t"
+    )
+  )
+
+  ratio_control_formula <- as.formula(
+    paste0(
+      outcome,
+      " ~ leverage * cantonal * i(t, ref = ",
+      reference_period,
+      ") | ID + t"
+    )
+  )
+
+  dummy_nocontrol_formula <- as.formula(
+    paste0(
+      outcome,
+      " ~ high_leverage * i(t, ref = ",
+      reference_period,
+      ") | ID + t"
+    )
+  )
+
+  dummy_control_formula <- as.formula(
+    paste0(
+      outcome,
+      " ~ high_leverage * cantonal * i(t, ref = ",
+      reference_period,
+      ") | ID + t"
+    )
+  )
+
+  # Weight formula
+  weight_formula <- as.formula(paste0("~", weight))
+
+  # Estimate models
+  model_ratio_nocontrol <- feols(
+    fml     = ratio_nocontrol_formula,
+    data    = full_data,
+    weights = weight_formula,
+    vcov    = ~ID,
+    fixef.rm = "none"
+  )
+
+  model_ratio_control <- feols(
+    fml     = ratio_control_formula,
+    data    = full_data,
+    weights = weight_formula,
+    vcov    = ~ID,
+    fixef.rm = "none"
+  )
+
+  model_dummy_nocontrol <- feols(
+    fml     = dummy_nocontrol_formula,
+    data    = full_data,
+    weights = weight_formula,
+    vcov    = ~ID,
+    fixef.rm = "none"
+  )
+
+  model_dummy_control <- feols(
+    fml     = dummy_control_formula,
+    data    = full_data,
+    weights = weight_formula,
+    vcov    = ~ID,
+    fixef.rm = "none"
+  )
+
+  # Observations used in the baseline ratio model
+  sample_rows <- fixest::obs(model_ratio_nocontrol)
+
+  estimation_sample <- full_data[sample_rows, , drop = FALSE]
+
+  # Summary statistics
+  stats_estimation_sample <- make_summary_stats(
+    estimation_sample,
+    outcome
+  )
+
+  stats_t4_raw <- make_summary_stats(
+    raw_t4,
+    outcome
+  )
+
+  stats_all_raw <- make_summary_stats(
+    raw_data,
+    outcome
+  )
+
+  list(
+    models = list(
+      ratio_nocontrol = model_ratio_nocontrol,
+      ratio_control   = model_ratio_control,
+      dummy_nocontrol = model_dummy_nocontrol,
+      dummy_control   = model_dummy_control
+    ),
+    estimation_sample = estimation_sample,
+    summary_stats = list(
+      estimation_sample = stats_estimation_sample,
+      t4_raw             = stats_t4_raw,
+      all_raw            = stats_all_raw
+    )
+  )
+}
+```
+
+```{r running the main calcultions}
+results_profit <- estimate_outcome_models(
+  full_data = full_profit,
+  raw_data  = estimation_profit_raw,
+  raw_t4    = estimation_profit_t4_raw,
+  outcome   = "Profit_sum",
+  weight    = "IPW_profit"
+)
+
+results_loan <- estimate_outcome_models(
+  full_data = full_loan,
+  raw_data  = estimation_loan_raw,
+  raw_t4    = estimation_loan_t4_raw,
+  outcome   = "loan_sum",
+  weight    = "IPW_loan"
+)
+
+results_equity <- estimate_outcome_models(
+  full_data = full_equity,
+  raw_data  = estimation_equity_raw,
+  raw_t4    = estimation_equity_t4_raw,
+  outcome   = "equity_sum",
+  weight    = "IPW_equity"
+)
+
+results_assets_noloan <- estimate_outcome_models(
+  full_data = full_assets_noloan,
+  raw_data  = estimation_assets_noloan_raw,
+  raw_t4    = estimation_assets_noloan_t4_raw,
+  outcome   = "assets_sum",
+  weight    = "IPW_assets_noloan"
+)
+
+summary(results_profit$models$ratio_nocontrol)
+summary(results_profit$models$ratio_control)
+summary(results_profit$models$dummy_nocontrol)
+summary(results_profit$models$dummy_control)
+
+``` 
+
+```{r baseline results ratio}
+
+baseline_ratio_models <- list(
+  "Equity" = results_equity$models$ratio_nocontrol,
+  "Profits" = results_profit$models$ratio_nocontrol,
+  "Loans" = results_loan$models$ratio_nocontrol,
+  "Financial assets w/o loans" =
+    results_assets_noloan$models$ratio_nocontrol
+)
+
+etable(
+  baseline_ratio_models,
+  headers = "Dependent variable",
+  keep = "leverage",
+  coefstat = "se",
+  digits = 3,
+  signif.code = c(
+    "***" = 0.01,
+    "**"  = 0.05,
+    "*"   = 0.10
+  ),
+  fitstat = ~ n + ar2,
+  fixef_sizes = FALSE
+)
+
+```
+
+```{r marginal effects}
+
+library(marginaleffects)
+library(dplyr)
+
+model_objects <- list(
+  dummy_profits         = results_profit$models$dummy_control,
+  ratio_profits         = results_profit$models$ratio_control,
+  dummy_equity          = results_equity$models$dummy_control,
+  ratio_equity          = results_equity$models$ratio_control,
+  dummy_loans           = results_loan$models$dummy_control,
+  ratio_loans           = results_loan$models$ratio_control,
+  dummy_assets_noloan   = results_assets_noloan$models$dummy_control,
+  ratio_assets_noloan   = results_assets_noloan$models$ratio_control
+)
+
+model_data <- list(
+  dummy_profits         = full_profit,
+  ratio_profits         = full_profit,
+  dummy_equity          = full_equity,
+  ratio_equity          = full_equity,
+  dummy_loans           = full_loan,
+  ratio_loans           = full_loan,
+  dummy_assets_noloan   = full_assets_noloan,
+  ratio_assets_noloan   = full_assets_noloan
+)
+
+mfx_list <- list()
+
+for (name in names(model_objects)) {
+
+  model <- model_objects[[name]]
+
+  # Use only observations with an observed outcome and positive IPW
+  dataset <- model_data[[name]] %>%
+    filter(
+      observed == 1,
+      t %in% 2:7
+    )
+
+  coefficient_names <- names(coef(model))
+
+  if (any(grepl("high_leverage", coefficient_names))) {
+    leverage_var <- "high_leverage"
+  } else if (any(grepl("leverage", coefficient_names))) {
+    leverage_var <- "leverage"
+  } else {
+    stop(
+      paste(
+        "Neither leverage nor high_leverage found in model",
+        name
+      )
+    )
+  }
+
+  mfx_list[[name]] <- avg_slopes(
+    model,
+    variables = leverage_var,
+    newdata = dataset,
+    by = c("cantonal", "t")
+  )
+}
+
+mfx_table <- bind_rows(
+  lapply(names(mfx_list), function(name) {
+
+    as.data.frame(mfx_list[[name]]) %>%
+      mutate(model = name)
+  })
+) %>%
+  select(
+    model,
+    cantonal,
+    t,
+    term,
+    contrast,
+    estimate,
+    std.error,
+    conf.low,
+    conf.high,
+    p.value
+  ) %>%
+  arrange(model, cantonal, t)
+
+mfx_table
+
+c(
+  equity = nobs(results_equity$models$ratio_control),
+  profits = nobs(results_profit$models$ratio_control),
+  loans = nobs(results_loan$models$ratio_control),
+  assets_noloan = nobs(
+    results_assets_noloan$models$ratio_control
+  )
+)
+
+```
+
+######## ROBUSTNESS ########
+######## Robustness Check - dummy leverage:
+
+```{r dummy}
+
+baseline_dummy_models <- list(
+  "Equity" =
+    results_equity$models$dummy_nocontrol,
+
+  "Profits" =
+    results_profit$models$dummy_nocontrol,
+
+  "Loans" =
+    results_loan$models$dummy_nocontrol,
+
+  "Financial assets w/o loans" =
+    results_assets_noloan$models$dummy_nocontrol
+)
+
+etable(
+  baseline_dummy_models,
+  headers = "Dependent variable",
+  keep = "high_leverage",
+  coefstat = "se",
+  digits = 3,
+  signif.code = c(
+    "***" = 0.01,
+    "**"  = 0.05,
+    "*"   = 0.10
+  ),
+  fitstat = ~ n + ar2,
+  fixef_sizes = FALSE
+)
+
+control_dummy_models <- list(
+  "Equity" =
+    results_equity$models$dummy_control,
+
+  "Profits" =
+    results_profit$models$dummy_control,
+
+  "Loans" =
+    results_loan$models$dummy_control,
+
+  "Financial assets w/o loans" =
+    results_assets_noloan$models$dummy_control
+)
+
+etable(
+  control_dummy_models,
+  headers = "Dependent variable",
+  keep = "high_leverage|cantonal",
+  coefstat = "se",
+  digits = 3,
+  signif.code = c(
+    "***" = 0.01,
+    "**"  = 0.05,
+    "*"   = 0.10
+  ),
+  fitstat = ~ n + ar2,
+  fixef_sizes = FALSE
+)
+
+mfx_list$dummy_equity %>% arrange(cantonal, t)
+mfx_list$dummy_profits %>% arrange(cantonal, t)
+mfx_list$dummy_loans %>% arrange(cantonal, t)
+mfx_list$dummy_assets_noloan %>% arrange(cantonal, t)
+
+```
+
+######## Robustness Check - w/o Winsorization:
+
+```{r w/o winsorization}
+
+make_unwinsorized_full <- function(
+    full_data,
+    raw_data,
+    outcome
+) {
+
+  raw_outcome <- raw_data %>%
+    as.data.frame() %>%
+    transmute(
+      ID = as.character(ID),
+      t  = as.integer(as.character(t)),
+      raw_outcome = .data[[outcome]]
+    )
+
+  full_data %>%
+    as.data.frame() %>%
+    mutate(
+      ID = as.character(ID),
+      t  = as.integer(as.character(t))
+    ) %>%
+    select(-all_of(outcome)) %>%
+    left_join(
+      raw_outcome,
+      by = c("ID", "t")
+    ) %>%
+    rename(
+      "{outcome}" := raw_outcome
+    ) %>%
+    arrange(ID, t)
+}
+
+
+full_profit_nowinsorization <- make_unwinsorized_full(
+  full_data = full_profit,
+  raw_data  = profit$raw,
+  outcome   = "Profit_sum"
+)
+
+full_equity_nowinsorization <- make_unwinsorized_full(
+  full_data = full_equity,
+  raw_data  = equity$raw,
+  outcome   = "equity_sum"
+)
+
+full_loan_nowinsorization <- make_unwinsorized_full(
+  full_data = full_loan,
+  raw_data  = loan$raw,
+  outcome   = "loan_sum"
+)
+
+full_assets_noloan_nowinsorization <- make_unwinsorized_full(
+  full_data = full_assets_noloan,
+  raw_data  = assets_noloan$raw,
+  outcome   = "assets_sum"
+)
+```
+
+
+```{r models without winsorization}
+
+results_profit_nowinsorization <- estimate_outcome_models(
+  full_data = full_profit_nowinsorization,
+  raw_data  = profit$raw,
+  raw_t4    = profit$raw_t4,
+  outcome   = "Profit_sum",
+  weight    = "IPW_profit"
+)
+
+results_equity_nowinsorization <- estimate_outcome_models(
+  full_data = full_equity_nowinsorization,
+  raw_data  = equity$raw,
+  raw_t4    = equity$raw_t4,
+  outcome   = "equity_sum",
+  weight    = "IPW_equity"
+)
+
+results_loan_nowinsorization <- estimate_outcome_models(
+  full_data = full_loan_nowinsorization,
+  raw_data  = loan$raw,
+  raw_t4    = loan$raw_t4,
+  outcome   = "loan_sum",
+  weight    = "IPW_loan"
+)
+
+results_assets_noloan_nowinsorization <- estimate_outcome_models(
+  full_data = full_assets_noloan_nowinsorization,
+  raw_data  = assets_noloan$raw,
+  raw_t4    = assets_noloan$raw_t4,
+  outcome   = "assets_sum",
+  weight    = "IPW_assets_noloan"
+)
+
+```
+  
+```{r baseline results without winsorization}
+
+baseline_ratio_models_nowinsorization <- list(
+  "Equity" =
+    results_equity_nowinsorization$models$ratio_nocontrol,
+
+  "Profits" =
+    results_profit_nowinsorization$models$ratio_nocontrol,
+
+  "Loans" =
+    results_loan_nowinsorization$models$ratio_nocontrol,
+
+  "Financial assets w/o loans" =
+    results_assets_noloan_nowinsorization$models$ratio_nocontrol
+)
+
+etable(
+  baseline_ratio_models_nowinsorization,
+  headers = "Dependent variable",
+  keep = "leverage",
+  coefstat = "se",
+  digits = 3,
+  signif.code = c(
+    "***" = 0.01,
+    "**"  = 0.05,
+    "*"   = 0.10
+  ),
+  fitstat = ~ n + ar2,
+  fixef_sizes = FALSE
+)
+
+```
+
+```{r triple difference without winsorization}
+
+control_ratio_models_nowinsorization <- list(
+  "Equity" =
+    results_equity_nowinsorization$models$ratio_control,
+
+  "Profits" =
+    results_profit_nowinsorization$models$ratio_control,
+
+  "Loans" =
+    results_loan_nowinsorization$models$ratio_control,
+
+  "Financial assets w/o loans" =
+    results_assets_noloan_nowinsorization$models$ratio_control
+)
+
+etable(
+  control_ratio_models_nowinsorization,
+  headers = "Dependent variable",
+  keep = "leverage|cantonal",
+  coefstat = "se",
+  digits = 3,
+  signif.code = c(
+    "***" = 0.01,
+    "**"  = 0.05,
+    "*"   = 0.10
+  ),
+  fitstat = ~ n + ar2,
+  fixef_sizes = FALSE
+)
+
+```
+
+```{r marginal effects without winsorization}
+
+models_nowinsorization <- list(
+  ratio_profits =
+    results_profit_nowinsorization$models$ratio_control,
+
+  ratio_equity =
+    results_equity_nowinsorization$models$ratio_control,
+
+  ratio_loans =
+    results_loan_nowinsorization$models$ratio_control,
+
+  ratio_assets_noloan =
+    results_assets_noloan_nowinsorization$models$ratio_control
+)
+
+data_nowinsorization <- list(
+  ratio_profits       = full_profit_nowinsorization,
+  ratio_equity        = full_equity_nowinsorization,
+  ratio_loans         = full_loan_nowinsorization,
+  ratio_assets_noloan = full_assets_noloan_nowinsorization
+)
+
+mfx_list_nowinsorization <- list()
+
+for (name in names(models_nowinsorization)) {
+
+  model <- models_nowinsorization[[name]]
+
+  estimation_rows <- fixest::obs(model)
+
+  estimation_data <- data_nowinsorization[[name]][
+    estimation_rows,
+    ,
+    drop = FALSE
+  ]
+
+  mfx_list_nowinsorization[[name]] <- avg_slopes(
+    model,
+    variables = "leverage",
+    newdata = estimation_data,
+    by = c("cantonal", "t")
+  )
+}
+
+
+mfx_list_nowinsorization$ratio_equity %>%
+  arrange(cantonal, t)
+
+mfx_list_nowinsorization$ratio_profits %>%
+  arrange(cantonal, t)
+
+mfx_list_nowinsorization$ratio_loans %>%
+  arrange(cantonal, t)
+
+mfx_list_nowinsorization$ratio_assets_noloan %>%
+  arrange(cantonal, t)
+
+```
+
+######## Robustness Check - random assignment of leverage dummy:
+```{r random assignment placebo function}
+
+library(dplyr)
+library(purrr)
+library(fixest)
+library(broom)
+
+run_placebo_experiment <- function(
+    data,
+    outcome,
+    weight,
+    B = 1000,
+    seed = 42,
+    reference_period = 4
+) {
+
+  # Use the already prepared and winsorized baseline dataset
+  base_data <- data %>%
+    as.data.frame() %>%
+    mutate(
+      ID = as.character(ID),
+      t  = as.integer(as.character(t))
+    ) %>%
+    arrange(ID, t)
+
+  outcome_formula_nocontrol <- as.formula(
+    paste0(
+      outcome,
+      " ~ high_leverage_random * ",
+      "i(t, ref = ",
+      reference_period,
+      ") | ID + t"
+    )
+  )
+
+  outcome_formula_full <- as.formula(
+    paste0(
+      outcome,
+      " ~ high_leverage_random * cantonal * ",
+      "i(t, ref = ",
+      reference_period,
+      ") | ID + t"
+    )
+  )
+
+  weight_formula <- as.formula(
+    paste0("~", weight)
+  )
+
+  # Bank IDs used for random assignment
+  bank_ids <- base_data %>%
+    filter(
+      observed == 1L,
+      !is.na(.data[[outcome]]),
+      !is.na(.data[[weight]])
+    ) %>%
+    distinct(ID) %>%
+    arrange(ID) %>%
+    pull(ID)
+
+  number_treated <- length(bank_ids) %/% 2
+
+  run_one_draw <- function(draw_number) {
+
+    random_treated_ids <- sample(
+      bank_ids,
+      size = number_treated,
+      replace = FALSE
+    )
+
+    random_assignment <- tibble(
+      ID = bank_ids,
+      high_leverage_random = as.integer(
+        bank_ids %in% random_treated_ids
+      )
+    )
+
+    draw_data <- base_data %>%
+      left_join(
+        random_assignment,
+        by = "ID"
+      )
+
+    model_nocontrol <- feols(
+      fml = outcome_formula_nocontrol,
+      data = draw_data,
+      weights = weight_formula,
+      vcov = ~ID,
+      fixef.rm = "none"
+    )
+
+    model_full <- feols(
+      fml = outcome_formula_full,
+      data = draw_data,
+      weights = weight_formula,
+      vcov = ~ID,
+      fixef.rm = "none"
+    )
+
+    results_nocontrol <- broom::tidy(
+      model_nocontrol
+    ) %>%
+      filter(
+        grepl("high_leverage_random", term)
+      ) %>%
+      mutate(
+        model = "nocontrol",
+        draw = draw_number
+      )
+
+    results_full <- broom::tidy(
+      model_full
+    ) %>%
+      filter(
+        grepl("high_leverage_random", term)
+      ) %>%
+      mutate(
+        model = "full",
+        draw = draw_number
+      )
+
+    bind_rows(
+      results_nocontrol,
+      results_full
+    )
+  }
+
+  # Each outcome receives the same reproducible master seed
+  set.seed(seed)
+
+  placebo_draws <- map_dfr(
+    seq_len(B),
+    run_one_draw,
+    .progress = FALSE
+  )
+
+  placebo_summary <- placebo_draws %>%
+    group_by(model, term) %>%
+    summarise(
+      repetitions = n(),
+      mean_beta = mean(
+        estimate,
+        na.rm = TRUE
+      ),
+      sd_beta = sd(
+        estimate,
+        na.rm = TRUE
+      ),
+      p5 = quantile(
+        estimate,
+        probs = 0.05,
+        na.rm = TRUE
+      ),
+      p95 = quantile(
+        estimate,
+        probs = 0.95,
+        na.rm = TRUE
+      ),
+      sig_share_0.1 = mean(
+        p.value < 0.10,
+        na.rm = TRUE
+      ),
+      sig_share_0.05 = mean(
+        p.value < 0.05,
+        na.rm = TRUE
+      ),
+      sig_share_0.01 = mean(
+        p.value < 0.01,
+        na.rm = TRUE
+      ),
+      .groups = "drop"
+    )
+
+  list(
+    draws = placebo_draws,
+    summary = placebo_summary
+  )
+}
+```
+
+```{r run random assignment placebo tests}
+
+placebo_profit_results <- run_placebo_experiment(
+  data    = full_profit,
+  outcome = "Profit_sum",
+  weight  = "IPW_profit",
+  B       = 1000,
+  seed    = 42
+)
+
+placebo_equity_results <- run_placebo_experiment(
+  data    = full_equity,
+  outcome = "equity_sum",
+  weight  = "IPW_equity",
+  B       = 1000,
+  seed    = 42
+)
+
+placebo_loan_results <- run_placebo_experiment(
+  data    = full_loan,
+  outcome = "loan_sum",
+  weight  = "IPW_loan",
+  B       = 1000,
+  seed    = 42
+)
+
+placebo_assets_noloan_results <- run_placebo_experiment(
+  data    = full_assets_noloan,
+  outcome = "assets_sum",
+  weight  = "IPW_assets_noloan",
+  B       = 1000,
+  seed    = 42
+)
+```
+
+```{r placebo result objects}
+
+placebo_results <-
+  placebo_profit_results$draws
+
+summary_table <-
+  placebo_profit_results$summary
+
+
+placebo_equity <-
+  placebo_equity_results$draws
+
+summary_table_equity <-
+  placebo_equity_results$summary
+
+
+placebo_loans <-
+  placebo_loan_results$draws
+
+summary_table_loans <-
+  placebo_loan_results$summary
+
+
+placebo_assets <-
+  placebo_assets_noloan_results$draws
+
+summary_table_assets <-
+  placebo_assets_noloan_results$summary
+
+summary_table
+summary_table_equity
+summary_table_loans
+summary_table_assets
+
+placebo_summary_all <- bind_rows(
+  Profits = summary_table,
+  Equity = summary_table_equity,
+  Loans = summary_table_loans,
+  `Financial assets w/o loans` = summary_table_assets,
+  .id = "outcome"
+)
+
+placebo_summary_all
+
+```
+
+
+
+######## Robustness Check - use of balanced panel:
+
+```{r Create correct balanced panel}
+
+make_balanced_outcome_panel <- function(
+    data,
+    outcome,
+    periods = 2:7
+) {
+
+  balanced_ids <- data %>%
+    filter(t %in% periods) %>%
+    group_by(ID) %>%
+    summarise(
+      periods_observed = n_distinct(
+        t[!is.na(.data[[outcome]])]
+      ),
+      complete_outcome = all(
+        !is.na(.data[[outcome]][t %in% periods])
+      ),
+      complete_leverage = all(
+        !is.na(leverage[t %in% periods])
+      ),
+      complete_cantonal = all(
+        !is.na(cantonal[t %in% periods])
+      ),
+      .groups = "drop"
+    ) %>%
+    filter(
+      periods_observed == length(periods),
+      complete_outcome,
+      complete_leverage,
+      complete_cantonal
+    ) %>%
+    pull(ID)
+
+  data %>%
+    filter(
+      ID %in% balanced_ids,
+      t %in% periods
+    ) %>%
+    arrange(ID, t)
+}
+
+balanced_profit <- make_balanced_outcome_panel(
+  data    = full_profit,
+  outcome = "Profit_sum"
+)
+
+balanced_equity <- make_balanced_outcome_panel(
+  data    = full_equity,
+  outcome = "equity_sum"
+)
+
+balanced_loan <- make_balanced_outcome_panel(
+  data    = full_loan,
+  outcome = "loan_sum"
+)
+
+balanced_assets_noloan <- make_balanced_outcome_panel(
+  data    = full_assets_noloan,
+  outcome = "assets_sum"
+)
+
+```
+
+```{r models with balanced panel}
+
+estimate_balanced_ratio <- function(
+    data,
+    outcome,
+    reference_period = 4
+) {
+
+  formula <- as.formula(
+    paste0(
+      outcome,
+      " ~ leverage * i(t, ref = ",
+      reference_period,
+      ") | ID + t"
+    )
+  )
+
+  feols(
+    fml = formula,
+    data = data,
+    vcov = ~ID,
+    fixef.rm = "perfect_fit"
+  )
+}
+
+model_balanced_profit <- estimate_balanced_ratio(
+  data    = balanced_profit,
+  outcome = "Profit_sum"
+)
+
+model_balanced_equity <- estimate_balanced_ratio(
+  data    = balanced_equity,
+  outcome = "equity_sum"
+)
+
+model_balanced_loan <- estimate_balanced_ratio(
+  data    = balanced_loan,
+  outcome = "loan_sum"
+)
+
+model_balanced_assets_noloan <- estimate_balanced_ratio(
+  data    = balanced_assets_noloan,
+  outcome = "assets_sum"
+)
+
+balanced_ratio_models <- list(
+  "Equity" = model_balanced_equity,
+  "Profits" = model_balanced_profit,
+  "Loans" = model_balanced_loan,
+  "Financial assets w/o loans" =
+    model_balanced_assets_noloan
+)
+
+etable(
+  balanced_ratio_models,
+  headers = "Dependent variable",
+  keep = "leverage",
+  coefstat = "se",
+  digits = 3,
+  signif.code = c(
+    "***" = 0.01,
+    "**"  = 0.05,
+    "*"   = 0.10
+  ),
+  fitstat = ~ n + r2 + ar2,
+  fixef_sizes = FALSE
+)
+
+```
+
+```{r balanced panel with cantonal differentiation}
+
+estimate_balanced_triple <- function(
+    data,
+    outcome,
+    reference_period = 4
+) {
+
+  formula <- as.formula(
+    paste0(
+      outcome,
+      " ~ leverage * cantonal * i(t, ref = ",
+      reference_period,
+      ") | ID + t"
+    )
+  )
+
+  feols(
+    fml = formula,
+    data = data,
+    vcov = ~ID,
+    fixef.rm = "perfect_fit"
+  )
+}
+
+model_balanced_triple_profit <- estimate_balanced_triple(
+  data    = balanced_profit,
+  outcome = "Profit_sum"
+)
+
+model_balanced_triple_equity <- estimate_balanced_triple(
+  data    = balanced_equity,
+  outcome = "equity_sum"
+)
+
+model_balanced_triple_loan <- estimate_balanced_triple(
+  data    = balanced_loan,
+  outcome = "loan_sum"
+)
+
+model_balanced_triple_assets_noloan <- estimate_balanced_triple(
+  data    = balanced_assets_noloan,
+  outcome = "assets_sum"
+)
+
+balanced_triple_models <- list(
+  "Equity" =
+    model_balanced_triple_equity,
+  "Profits" =
+    model_balanced_triple_profit,
+  "Loans" =
+    model_balanced_triple_loan,
+  "Financial assets w/o loans" =
+    model_balanced_triple_assets_noloan
+)
+
+# Full DiD and triple-difference results
+etable(
+  balanced_triple_models,
+  headers = "Dependent variable",
+  keep = "leverage|cantonal",
+  coefstat = "se",
+  digits = 3,
+  signif.code = c(
+    "***" = 0.01,
+    "**"  = 0.05,
+    "*"   = 0.10
+  ),
+  fitstat = ~ n + ar2,
+  fixef_sizes = FALSE
+)
+```
+
+```{r balanced panel marginal effects}
+
+library(marginaleffects)
+
+balanced_triple_data <- list(
+  "Equity" =
+    balanced_equity,
+  "Profits" =
+    balanced_profit,
+  "Loans" =
+    balanced_loan,
+  "Financial assets w/o loans" =
+    balanced_assets_noloan
+)
+
+balanced_mfx_list <- Map(
+  function(model, dataset) {
+
+    avg_slopes(
+      model,
+      variables = "leverage",
+      newdata = dataset,
+      by = c("cantonal", "t")
+    )
+  },
+  balanced_triple_models,
+  balanced_triple_data
+)
+
+balanced_mfx_table <- bind_rows(
+  lapply(
+    names(balanced_mfx_list),
+    function(outcome_name) {
+
+      as.data.frame(
+        balanced_mfx_list[[outcome_name]]
+      ) %>%
+        mutate(outcome = outcome_name)
+    }
+  )
+) %>%
+  mutate(
+    relative_period = t - 4,
+    bank_type = if_else(
+      cantonal == 1,
+      "Government-linked banks",
+      "Non-government-linked banks"
+    ),
+    stars = case_when(
+      p.value < 0.01 ~ "***",
+      p.value < 0.05 ~ "**",
+      p.value < 0.10 ~ "*",
+      TRUE           ~ ""
+    ),
+    estimate_formatted = paste0(
+      sprintf("%.3f", estimate),
+      stars
+    ),
+    se_formatted = paste0(
+      "(",
+      sprintf("%.3f", std.error),
+      ")"
+    )
+  ) %>%
+  filter(t != 4) %>%
+  select(
+    outcome,
+    bank_type,
+    cantonal,
+    t,
+    relative_period,
+    estimate,
+    std.error,
+    conf.low,
+    conf.high,
+    p.value,
+    stars,
+    estimate_formatted,
+    se_formatted
+  ) %>%
+  arrange(
+    cantonal,
+    relative_period,
+    outcome
+  )
+
+balanced_mfx_table
+
+balanced_mfx_wide <- balanced_mfx_table %>%
+  select(
+    bank_type,
+    relative_period,
+    outcome,
+    estimate_formatted,
+    se_formatted
+  ) %>%
+  pivot_wider(
+    names_from = outcome,
+    values_from = c(
+      estimate_formatted,
+      se_formatted
+    )
+  ) %>%
+  arrange(
+    factor(
+      bank_type,
+      levels = c(
+        "Non-government-linked banks",
+        "Government-linked banks"
+      )
+    ),
+    relative_period
+  )
+
+balanced_mfx_wide
+
+```
+
+######## Robustness Check - standard errors and bootstrapping
+
+```{r heteroskedasticity robust standard errors}
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(fixest)
+library(marginaleffects)
+library(boot)
+library(ggplot2)
+
+# Confirm that all previously prepared datasets exist
+stopifnot(
+  exists("full_profit"),
+  exists("full_equity"),
+  exists("full_loan"),
+  exists("full_assets_noloan")
+)
+
+estimate_ratio_models_hetero <- function(
+    data,
+    outcome,
+    weight,
+    reference_period = 4
+) {
+
+  formula_nocontrol <- as.formula(
+    paste0(
+      outcome,
+      " ~ leverage * i(t, ref = ",
+      reference_period,
+      ") | ID + t"
+    )
+  )
+
+  formula_control <- as.formula(
+    paste0(
+      outcome,
+      " ~ leverage * cantonal * i(t, ref = ",
+      reference_period,
+      ") | ID + t"
+    )
+  )
+
+  weight_formula <- as.formula(
+    paste0("~", weight)
+  )
+
+  list(
+    nocontrol = feols(
+      fml = formula_nocontrol,
+      data = data,
+      weights = weight_formula,
+      vcov = "hetero",
+    fixef.rm = "none"
+    ),
+
+    control = feols(
+      fml = formula_control,
+      data = data,
+      weights = weight_formula,
+      vcov = "hetero",
+      fixef.rm = "none"
+    )
+  )
+}
+
+hetero_profit <- estimate_ratio_models_hetero(
+  data = full_profit,
+  outcome = "Profit_sum",
+  weight = "IPW_profit"
+)
+
+hetero_equity <- estimate_ratio_models_hetero(
+  data = full_equity,
+  outcome = "equity_sum",
+  weight = "IPW_equity"
+)
+
+hetero_loan <- estimate_ratio_models_hetero(
+  data = full_loan,
+  outcome = "loan_sum",
+  weight = "IPW_loan"
+)
+
+hetero_assets_noloan <- estimate_ratio_models_hetero(
+  data = full_assets_noloan,
+  outcome = "assets_sum",
+  weight = "IPW_assets_noloan"
+)
+
+model_ratio_profit_attrition_nocontrol <-
+  hetero_profit$nocontrol
+
+model_ratio_profit_attrition <-
+  hetero_profit$control
+
+model_ratio_equity_attrition_nocontrol <-
+  hetero_equity$nocontrol
+
+model_ratio_equity_attrition <-
+  hetero_equity$control
+
+model_ratio_loan_attrition_nocontrol <-
+  hetero_loan$nocontrol
+
+model_ratio_loan_attrition <-
+  hetero_loan$control
+
+model_ratio_assets_noloan_attrition_nocontrol <-
+  hetero_assets_noloan$nocontrol
+
+model_ratio_assets_noloan_attrition <-
+  hetero_assets_noloan$control
+
+summary(model_ratio_profit_attrition_nocontrol)
+summary(model_ratio_profit_attrition)
+
+summary(model_ratio_equity_attrition_nocontrol)
+summary(model_ratio_equity_attrition)
+
+summary(model_ratio_loan_attrition_nocontrol)
+summary(model_ratio_loan_attrition)
+
+summary(model_ratio_assets_noloan_attrition_nocontrol)
+summary(model_ratio_assets_noloan_attrition)
+
+hetero_nocontrol_models <- list(
+  ratio_profits_nocontrol = model_ratio_profit_attrition_nocontrol,
+  ratio_equity_nocontrol = model_ratio_equity_attrition_nocontrol,
+  ratio_loans_nocontrol = model_ratio_loan_attrition_nocontrol,
+  ratio_assets_noloan_nocontrol =
+    model_ratio_assets_noloan_attrition_nocontrol
+)
+
+hetero_control_models <- list(
+  ratio_profits = model_ratio_profit_attrition,
+  ratio_equity = model_ratio_equity_attrition,
+  ratio_loans = model_ratio_loan_attrition,
+  ratio_assets_noloan =
+    model_ratio_assets_noloan_attrition
+)
+
+hetero_model_data <- list(
+  ratio_profits = full_profit,
+  ratio_equity = full_equity,
+  ratio_loans = full_loan,
+  ratio_assets_noloan =
+    full_assets_noloan
+)
+
+etable(
+  hetero_nocontrol_models,
+  keep = "leverage",
+  coefstat = "se",
+  digits = 3,
+  signif.code = c(
+    "***" = 0.01,
+    "**"  = 0.05,
+    "*"   = 0.10
+  ),
+  fitstat = ~ n + r2 + ar2,
+  fixef_sizes = FALSE
+)
+
+etable(
+  hetero_control_models,
+  keep = "leverage|cantonal",
+  coefstat = "se",
+  digits = 3,
+  signif.code = c(
+    "***" = 0.01,
+    "**"  = 0.05,
+    "*"   = 0.10
+  ),
+  fitstat = ~ n + r2 + ar2,
+  fixef_sizes = FALSE
+)
+
+mfx_list_hetero <- Map(
+  function(model, dataset) {
+
+    estimation_rows <- fixest::obs(model)
+
+    estimation_data <- dataset[
+      estimation_rows,
+      ,
+      drop = FALSE
+    ]
+
+    avg_slopes(
+      model,
+      variables = "leverage",
+      newdata = estimation_data,
+      by = c("cantonal", "t"),
+      vcov = vcov(
+        model,
+        vcov = "hetero"
+      )
+    )
+  },
+  hetero_control_models,
+  hetero_model_data
+)
+
+```
+
+```{r  bootstrapping standard errors}
+
+cluster_bootstrap_model <- function(
+    model,
+    data,
+    outcome,
+    weight,
+    control = FALSE,
+    repetitions = 100,
+    seed = 123
+) {
+
+  coefficient_names <- names(coef(model))
+  bank_ids <- unique(data$ID)
+
+  if (control) {
+    bootstrap_formula <- as.formula(
+      paste0(
+        outcome,
+        " ~ leverage * cantonal * ",
+        "i(t, ref = 4) | boot_ID + t"
+      )
+    )
+  } else {
+    bootstrap_formula <- as.formula(
+      paste0(
+        outcome,
+        " ~ leverage * ",
+        "i(t, ref = 4) | boot_ID + t"
+      )
+    )
+  }
+
+  weight_formula <- as.formula(
+    paste0("~", weight)
+  )
+
+  bootstrap_statistic <- function(ids, indices) {
+
+    sampled_ids <- ids[indices]
+
+    bootstrap_data <- bind_rows(
+      lapply(
+        seq_along(sampled_ids),
+        function(draw_number) {
+
+          selected_data <- data %>%
+            filter(
+              ID == sampled_ids[draw_number]
+            )
+
+          selected_data$boot_ID <- paste0(
+            sampled_ids[draw_number],
+            "_",
+            draw_number
+          )
+
+          selected_data
+        }
+      )
+    )
+
+    output <- rep(
+      NA_real_,
+      length(coefficient_names)
+    )
+
+    names(output) <- coefficient_names
+
+    bootstrap_model <- tryCatch(
+      feols(
+        fml = bootstrap_formula,
+        data = bootstrap_data,
+        weights = weight_formula,
+        fixef.rm = "none"
+      ),
+      error = function(e) NULL
+    )
+
+    if (is.null(bootstrap_model)) {
+      return(output)
+    }
+
+    bootstrap_coefficients <- coef(
+      bootstrap_model
+    )
+
+    common_coefficients <- intersect(
+      names(output),
+      names(bootstrap_coefficients)
+    )
+
+    output[common_coefficients] <-
+      bootstrap_coefficients[common_coefficients]
+
+    output
+  }
+
+  set.seed(seed)
+
+  bootstrap_result <- boot::boot(
+    data = bank_ids,
+    statistic = bootstrap_statistic,
+    R = repetitions
+  )
+
+  bootstrap_se <- setNames(
+    apply(
+      bootstrap_result$t,
+      2,
+      sd,
+      na.rm = TRUE
+    ),
+    coefficient_names
+  )
+
+  original_coefficients <- coef(model)
+
+  results <- tibble(
+    term = names(original_coefficients),
+    estimate = as.numeric(original_coefficients),
+    boot_se = as.numeric(
+      bootstrap_se[
+        names(original_coefficients)
+      ]
+    )
+  ) %>%
+    mutate(
+      t_stat = estimate / boot_se,
+      p_value = 2 * pnorm(
+        abs(t_stat),
+        lower.tail = FALSE
+      ),
+      conf_low = estimate - 1.96 * boot_se,
+      conf_high = estimate + 1.96 * boot_se
+    )
+
+  list(
+    table = results,
+    boot = bootstrap_result
+  )
+}
+
+bootstrap_profit_nocontrol <- cluster_bootstrap_model(
+  model = model_ratio_profit_attrition_nocontrol,
+  data = full_profit,
+  outcome = "Profit_sum",
+  weight = "IPW_profit",
+  control = FALSE
+)
+
+bootstrap_profit <- cluster_bootstrap_model(
+  model = model_ratio_profit_attrition,
+  data = full_profit,
+  outcome = "Profit_sum",
+  weight = "IPW_profit",
+  control = TRUE
+)
+
+bootstrap_equity_nocontrol <- cluster_bootstrap_model(
+  model = model_ratio_equity_attrition_nocontrol,
+  data = full_equity,
+  outcome = "equity_sum",
+  weight = "IPW_equity",
+  control = FALSE
+)
+
+bootstrap_equity <- cluster_bootstrap_model(
+  model = model_ratio_equity_attrition,
+  data = full_equity,
+  outcome = "equity_sum",
+  weight = "IPW_equity",
+  control = TRUE
+)
+
+bootstrap_loan_nocontrol <- cluster_bootstrap_model(
+  model = model_ratio_loan_attrition_nocontrol,
+  data = full_loan,
+  outcome = "loan_sum",
+  weight = "IPW_loan",
+  control = FALSE
+)
+
+bootstrap_loan <- cluster_bootstrap_model(
+  model = model_ratio_loan_attrition,
+  data = full_loan,
+  outcome = "loan_sum",
+  weight = "IPW_loan",
+  control = TRUE
+)
+
+bootstrap_assets_noloan_nocontrol <- cluster_bootstrap_model(
+  model =
+    model_ratio_assets_noloan_attrition_nocontrol,
+  data = full_assets_noloan,
+  outcome = "assets_sum",
+  weight = "IPW_assets_noloan",
+  control = FALSE
+)
+
+bootstrap_assets_noloan <- cluster_bootstrap_model(
+  model = model_ratio_assets_noloan_attrition,
+  data = full_assets_noloan,
+  outcome = "assets_sum",
+  weight = "IPW_assets_noloan",
+  control = TRUE
+)
+
+bootstrap_table_profit_nocontrol <-
+  bootstrap_profit_nocontrol$table
+
+bootstrap_table_profit <-
+  bootstrap_profit$table
+
+bootstrap_table_equity_nocontrol <-
+  bootstrap_equity_nocontrol$table
+
+bootstrap_table_equity <-
+  bootstrap_equity$table
+
+bootstrap_table_loan_nocontrol <-
+  bootstrap_loan_nocontrol$table
+
+bootstrap_table_loan <-
+  bootstrap_loan$table
+
+bootstrap_table_assets_noloan_nocontrol <-
+  bootstrap_assets_noloan_nocontrol$table
+
+bootstrap_table_assets_noloan <-
+  bootstrap_assets_noloan$table
+
+
+
+
+
+bootstrap_table_profit_nocontrol
+bootstrap_table_profit
+
+bootstrap_table_equity_nocontrol
+bootstrap_table_equity
+
+bootstrap_table_loan_nocontrol
+bootstrap_table_loan
+
+bootstrap_table_assets_noloan_nocontrol
+bootstrap_table_assets_noloan
+
+
+
+bootstrap_marginal_effects <- function(
+    model,
+    data,
+    outcome,
+    weight,
+    repetitions = 100,
+    seed = 123
+) {
+
+  estimation_rows <- fixest::obs(model)
+
+  estimation_data <- data[
+    estimation_rows,
+    ,
+    drop = FALSE
+  ]
+
+  original_mfx <- avg_slopes(
+    model,
+    variables = "leverage",
+    newdata = estimation_data,
+    by = c("cantonal", "t")
+  ) %>%
+    as.data.frame() %>%
+    arrange(cantonal, t)
+
+  marginal_grid <- original_mfx %>%
+    select(cantonal, t)
+
+  bank_ids <- unique(data$ID)
+
+  bootstrap_formula <- as.formula(
+    paste0(
+      outcome,
+      " ~ leverage * cantonal * ",
+      "i(t, ref = 4) | boot_ID + t"
+    )
+  )
+
+  weight_formula <- as.formula(
+    paste0("~", weight)
+  )
+
+  bootstrap_statistic <- function(ids, indices) {
+
+    sampled_ids <- ids[indices]
+
+    bootstrap_data <- bind_rows(
+      lapply(
+        seq_along(sampled_ids),
+        function(draw_number) {
+
+          selected_data <- data %>%
+            filter(
+              ID == sampled_ids[draw_number]
+            )
+
+          selected_data$boot_ID <- paste0(
+            sampled_ids[draw_number],
+            "_",
+            draw_number
+          )
+
+          selected_data
+        }
+      )
+    )
+
+    bootstrap_model <- tryCatch(
+      feols(
+        fml = bootstrap_formula,
+        data = bootstrap_data,
+        weights = weight_formula,
+        fixef.rm = "none"
+      ),
+      error = function(e) NULL
+    )
+
+    if (is.null(bootstrap_model)) {
+      return(
+        rep(
+          NA_real_,
+          nrow(marginal_grid)
+        )
+      )
+    }
+
+    bootstrap_sample_rows <- fixest::obs(
+      bootstrap_model
+    )
+
+    bootstrap_estimation_data <- bootstrap_data[
+      bootstrap_sample_rows,
+      ,
+      drop = FALSE
+    ]
+
+    bootstrap_mfx <- tryCatch(
+      avg_slopes(
+        bootstrap_model,
+        variables = "leverage",
+        newdata = bootstrap_estimation_data,
+        by = c("cantonal", "t")
+      ) %>%
+        as.data.frame() %>%
+        select(
+          cantonal,
+          t,
+          estimate
+        ),
+      error = function(e) NULL
+    )
+
+    if (is.null(bootstrap_mfx)) {
+      return(
+        rep(
+          NA_real_,
+          nrow(marginal_grid)
+        )
+      )
+    }
+
+    marginal_grid %>%
+      left_join(
+        bootstrap_mfx,
+        by = c("cantonal", "t")
+      ) %>%
+      pull(estimate)
+  }
+
+  set.seed(seed)
+
+  bootstrap_result <- boot::boot(
+    data = bank_ids,
+    statistic = bootstrap_statistic,
+    R = repetitions
+  )
+
+  original_mfx %>%
+    mutate(
+      boot_se = apply(
+        bootstrap_result$t,
+        2,
+        sd,
+        na.rm = TRUE
+      ),
+      t_stat_boot = estimate / boot_se,
+      p_value_boot = 2 * pnorm(
+        abs(t_stat_boot),
+        lower.tail = FALSE
+      ),
+      conf_low_boot =
+        estimate - 1.96 * boot_se,
+      conf_high_boot =
+        estimate + 1.96 * boot_se
+    )
+}
+
+
+
+
+mfx_bootstrap_profit <- bootstrap_marginal_effects(
+  model = model_ratio_profit_attrition,
+  data = full_profit,
+  outcome = "Profit_sum",
+  weight = "IPW_profit"
+)
+
+mfx_bootstrap_equity <- bootstrap_marginal_effects(
+  model = model_ratio_equity_attrition,
+  data = full_equity,
+  outcome = "equity_sum",
+  weight = "IPW_equity"
+)
+
+mfx_bootstrap_loan <- bootstrap_marginal_effects(
+  model = model_ratio_loan_attrition,
+  data = full_loan,
+  outcome = "loan_sum",
+  weight = "IPW_loan"
+)
+
+mfx_bootstrap_assets_noloan <-
+  bootstrap_marginal_effects(
+    model =
+      model_ratio_assets_noloan_attrition,
+    data = full_assets_noloan,
+    outcome = "assets_sum",
+    weight = "IPW_assets_noloan"
+  )
+
+
+mfx_list_bootstrap <- list(
+  ratio_profits = mfx_bootstrap_profit,
+  ratio_equity = mfx_bootstrap_equity,
+  ratio_loans = mfx_bootstrap_loan,
+  ratio_assets_noloan =
+    mfx_bootstrap_assets_noloan
+)
+
+
+
+mfx_list_bootstrap$ratio_equity %>%
+  arrange(cantonal, t)
+
+mfx_list_bootstrap$ratio_profits %>%
+  arrange(cantonal, t)
+
+mfx_list_bootstrap$ratio_assets_noloan %>%
+  arrange(cantonal, t)
+
+mfx_list_bootstrap$ratio_loans %>%
+  arrange(cantonal, t)
+
+```
+
+######## Leave one out and leave one in
+
+```{r leave one in or out}
+
+library(dplyr)
+library(stringr)
+library(fixest)
+
+# ------------------------------------------------------------
+# 0) Harmonize key types
+# ------------------------------------------------------------
+panel_unbalanced_real_date <- panel_unbalanced_real_date %>%
+  mutate(
+    ID = as.character(ID),
+    cantonal = as.character(cantonal)
+  )
+
+full_equity <- full_equity %>%
+  mutate(
+    ID = as.character(ID),
+    cantonal = as.character(cantonal)
+  )
+
+# ------------------------------------------------------------
+# 1) Assets
+# ------------------------------------------------------------
+assets_sum <- panel_unbalanced_real_date %>%
+  filter(Category == "Sum of Assets") %>%
+  group_by(ID, t, cantonal) %>%
+  summarise(
+    total_assets = sum(Value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------
+# 2) Liability codes
+#    Keep 3.3.3 separate from 3.3
+# ------------------------------------------------------------
+liab_lvl2 <- panel_unbalanced_real_date %>%
+  mutate(
+    code_full = str_extract(
+      Category,
+      "(?<=\\()3(?:\\.\\d+){1,2}(?=\\))"
+    ),
+    code_lvl2 = str_extract(code_full, "^3\\.\\d"),
+    code_group = case_when(
+      code_full == "3.3.3" ~ "3.3.3",
+      TRUE ~ code_lvl2
+    )
+  ) %>%
+  filter(
+    code_lvl2 %in% c(
+      "3.1",
+      "3.2",
+      "3.3",
+      "3.4",
+      "3.5"
+    )
+  )
+
+# ------------------------------------------------------------
+# 3) Function to build leverage ratio at t = 4
+# ------------------------------------------------------------
+build_debt_t4 <- function(
+  liab_data,
+  assets_data,
+  keep_codes
+){
+
+  liab_data %>%
+    filter(code_group %in% keep_codes) %>%
+
+    group_by(ID, t, cantonal) %>%
+    summarise(
+      total_debt = sum(Value, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+
+    inner_join(
+      assets_data,
+      by = c("ID", "t", "cantonal")
+    ) %>%
+
+    mutate(
+      debt_ratio = total_debt / total_assets
+    ) %>%
+
+    filter(t == 4) %>%
+
+    group_by(ID, cantonal) %>%
+    summarise(
+      debt_t4 = mean(debt_ratio, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+# ------------------------------------------------------------
+# 4) Liability groups
+# ------------------------------------------------------------
+codes_all <- c(
+  "3.1",
+  "3.2",
+  "3.3",
+  "3.3.3",
+  "3.4",
+  "3.5"
+)
+
+# ------------------------------------------------------------
+# 5) Baseline model
+# ------------------------------------------------------------
+debt_t4_all <- build_debt_t4(
+  liab_lvl2,
+  assets_sum,
+  codes_all
+) %>%
+  rename(debt_t4_all = debt_t4)
+
+full_equity_all <- full_equity %>%
+  inner_join(
+    debt_t4_all,
+    by = c("ID", "cantonal")
+  )
+
+m_full <- feols(
+  equity_sum ~ i(t, debt_t4_all, ref = 4) |
+    ID + t,
+  data = full_equity_all,
+  weights = ~IPW_equity,
+  vcov = ~ID,
+  fixef.rm = "none"
+)
+
+# ============================================================
+# LEAVE-ONE-OUT
+# ============================================================
+
+models_leaveout <- list()
+
+for(drop_code in codes_all){
+
+  keep_codes <- setdiff(
+    codes_all,
+    drop_code
+  )
+
+  debt_tmp <- build_debt_t4(
+    liab_lvl2,
+    assets_sum,
+    keep_codes
+  )
+
+  tmp_panel <- full_equity %>%
+    inner_join(
+      debt_tmp,
+      by = c("ID", "cantonal")
+    )
+
+  models_leaveout[[paste0(
+    "drop_",
+    drop_code
+  )]] <- feols(
+    equity_sum ~ i(t, debt_t4, ref = 4) |
+      ID + t,
+    data = tmp_panel,
+    weights = ~IPW_equity,
+    vcov = ~ID,
+  fixef.rm = "none"
+  )
+}
+
+etable(
+  m_full,
+  models_leaveout,
+  headers = c(
+    "Baseline",
+    "-3.1",
+    "-3.2",
+    "-3.3",
+    "-3.3.3",
+    "-3.4",
+    "-3.5"
+  ),
+  dict = c(
+    "debt_t4_all" = "Leverage ratio",
+    "debt_t4" = "Leverage ratio"
+  )
+)
+
+# ============================================================
+# LEAVE-ONE-IN
+# ============================================================
+
+models_leavein <- list()
+
+for(keep_code in codes_all){
+
+  debt_tmp <- build_debt_t4(
+    liab_lvl2,
+    assets_sum,
+    keep_codes = keep_code
+  )
+
+  tmp_panel <- full_equity %>%
+    inner_join(
+      debt_tmp,
+      by = c("ID", "cantonal")
+    )
+
+  models_leavein[[paste0(
+    "keep_",
+    keep_code
+  )]] <- feols(
+    equity_sum ~ i(t, debt_t4, ref = 4) |
+      ID + t,
+    data = tmp_panel,
+    weights = ~IPW_equity,
+    vcov = ~ID,
+    fixef.rm = "none"
+  )
+}
+
+etable(
+  m_full,
+  models_leavein,
+  headers = c(
+    "Baseline",
+    "Only 3.1",
+    "Only 3.2",
+    "Only 3.3",
+    "Only 3.3.3",
+    "Only 3.4",
+    "Only 3.5"
+  ),
+  dict = c(
+    "debt_t4_all" = "Leverage ratio",
+    "debt_t4" = "Leverage ratio"
+  )
+)
+
+```
+
+######## split sample by cantonal
+
+```{r baseline split sample by cantonal}
+
+estimate_split_ratio <- function(
+    data,
+    outcome,
+    weight,
+    cantonal_value,
+    reference_period = 4
+) {
+
+  model_formula <- as.formula(
+    paste0(
+      outcome,
+      " ~ leverage * i(t, ref = ",
+      reference_period,
+      ") | ID + t"
+    )
+  )
+
+  weight_formula <- as.formula(
+    paste0("~", weight)
+  )
+
+  feols(
+    fml = model_formula,
+    data = data %>%
+      filter(
+        cantonal == cantonal_value,
+        observed == 1L,
+        !is.na(.data[[outcome]]),
+        !is.na(.data[[weight]]),
+        .data[[weight]] > 0
+      ),
+    weights = weight_formula,
+    vcov = ~ID,
+    fixef.rm = "none"
+  )
+}
+
+
+# Non-government-linked banks: cantonal = 0
+
+model_split_equity_0 <- estimate_split_ratio(
+  data = full_equity,
+  outcome = "equity_sum",
+  weight = "IPW_equity",
+  cantonal_value = 0
+)
+
+
+# Government-linked banks: cantonal = 1
+
+model_split_equity_1 <- estimate_split_ratio(
+  data = full_equity,
+  outcome = "equity_sum",
+  weight = "IPW_equity",
+  cantonal_value = 1
+)
+
+
+
+
+
+split_ratio_models_0 <- list(
+  "Equity" = model_split_equity_0
+)
+
+split_ratio_models_1 <- list(
+  "Equity" = model_split_equity_1
+)
+
+
+# Non-government-linked banks
+
+etable(
+  split_ratio_models_0,
+  headers = "Dependent variable",
+  keep = "leverage",
+  coefstat = "se",
+  digits = 3,
+  signif.code = c(
+    "***" = 0.01,
+    "**"  = 0.05,
+    "*"   = 0.10
+  ),
+  fitstat = ~ n + ar2,
+  fixef_sizes = FALSE
+)
+
+
+# Government-linked banks
+
+etable(
+  split_ratio_models_1,
+  headers = "Dependent variable",
+  keep = "leverage",
+  coefstat = "se",
+  digits = 3,
+  signif.code = c(
+    "***" = 0.01,
+    "**"  = 0.05,
+    "*"   = 0.10
+  ),
+  fitstat = ~ n + ar2,
+  fixef_sizes = FALSE
+)
+
+
+```
