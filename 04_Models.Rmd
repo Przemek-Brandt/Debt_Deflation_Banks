@@ -398,16 +398,6 @@ prepare_outcome <- function(
       )
     )
   ) %>%
-  mutate(
-    outcome_value = DescTools::Winsorize(
-      outcome_value,
-      val = quantile(
-        outcome_value,
-        probs = winsor_probs,
-        na.rm = TRUE
-      )
-    )
-  ) %>%
   ungroup()
 
   # 6. Construct complete ID × t grid
