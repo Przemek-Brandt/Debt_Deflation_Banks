@@ -1,9 +1,14 @@
 ---
-title: "04_Models"
+title: "Models"
 author: "Przemyslaw Brandt, Lukas Mair, Martin Mosler, Christoph A. Schaltegger"
 date: "11 09 2026"
 output: html_document
 ---
+
+The firm dataset was created in the other R-scripts. Therefore we just need to load them here.
+We combine the datasets with the classification of the banks in cantonal banks and noncantonal banks.
+
+
 ######## Setup
 
 ```{r setup, include=FALSE}
@@ -38,7 +43,7 @@ We combine the datasets with the classification of the banks in cantonal banks a
 
 ```{r Reading firm datasets}
 
-here::i_am("04_Models.Rmd")
+here::i_am("Models.Rmd")
 
 panel_unbalanced_ratios_date <- readxl::read_xlsx(
   here::here("DATA", "panel_unbalanced_ratios_date.xlsx")
@@ -729,6 +734,7 @@ estimate_outcome_models <- function(
 ```
 
 ```{r running the main calcultions}
+
 results_profit <- estimate_outcome_models(
   full_data = full_profit,
   raw_data  = estimation_profit_raw,
@@ -761,6 +767,7 @@ results_assets_noloan <- estimate_outcome_models(
   weight    = "IPW_assets_noloan"
 )
 
+summary(results_equity$models$ratio_nocontrol)
 summary(results_profit$models$ratio_nocontrol)
 summary(results_profit$models$ratio_control)
 summary(results_profit$models$dummy_nocontrol)
